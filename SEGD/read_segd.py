@@ -66,8 +66,8 @@ def read_traces(file_ptr, samples, traces, hdr_length, format):
     data_raw = 0
     trace = 0
     sample = 0
-    print(f'traces: {file_ptr.peek()[0]}, samples: {samples}')
-    print(f'file_ptr: {file_ptr}, hdr_length: {hdr_length}, f+h: {hdr_length}')
+    #print(f'traces: {file_ptr.peek()[0]}, samples: {samples}')
+    #print(f'file_ptr: {file_ptr}, hdr_length: {hdr_length}, f+h: {hdr_length}')
 
     for trace in range(traces):
         file_ptr.seek(hdr_length, 1)
@@ -243,7 +243,7 @@ class SEGD(object):
                     # 24 bit data
                     ch_hdr._trace_length   =   ch_hdr._hdr_length+ch_hdr._samples*3
                 
-                print(f'entry point #{count}: {ch_hdr._trace_length} : {ch_hdr._hdr_length} : {ch_hdr._samples}')
+                #print(f'entry point #{count}: {ch_hdr._trace_length} : {ch_hdr._hdr_length} : {ch_hdr._samples}')
                 count = count + 1 
                 # jump to next channel set
                 file_ptr.seek(ch_hdr.channels*ch_hdr._trace_length - 20, 1)
