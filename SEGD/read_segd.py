@@ -1,7 +1,5 @@
-from struct import unpack
+from struct import unpack, pack
 from datetime import datetime, timedelta
-from .read_traces import read_traces
-import pandas
 import numpy
 
 def pbcd2dec(pbcd):
@@ -15,11 +13,83 @@ def pbcd2dec(pbcd):
     
     return decode
 
+def convert_24bit(byte_string1, byte_string2, byte_string3):
+    return (byte_string1<<24|byte_string2<<16|byte_string3<<8)>>8
+
+
+
+# Convert 32 bits to their IEEEE 754
+# Taken from https://gist.github.com/AlexEshoo/d3edc53129ed010b0a5b693b88c7e0b5
+def ieee_754_conversion(n, sgn_len=1, exp_len=8, mant_len=23):
+    """
+    Converts an arbitrary precision Floating Point number.
+    Note: Since the calculations made by python inherently use floats, the accuracy is poor at high precision.
+    :param n: An unsigned integer of length `sgn_len` + `exp_len` + `mant_len` to be decoded as a float
+    :param sgn_len: number of sign bits
+    :param exp_len: number of exponent bits
+    :param mant_len: number of mantissa bits
+    :return: IEEE 754 Floating Point representation of the number `n`
+    """
+    if n >= 2 ** (sgn_len + exp_len + mant_len):
+        raise ValueError("Number n is longer than prescribed parameters allows")
+
+    sign = (n & (2 ** sgn_len - 1) * (2 ** (exp_len + mant_len))) >> (exp_len + mant_len)
+    exponent_raw = (n & ((2 ** exp_len - 1) * (2 ** mant_len))) >> mant_len
+    mantissa = n & (2 ** mant_len - 1)
+
+    sign_mult = 1
+    if sign == 1:
+        sign_mult = -1
+
+    if exponent_raw == 2 ** exp_len - 1:  # Could be Inf or NaN
+        if mantissa == 2 ** mant_len - 1:
+            return float('nan')  # NaN
+
+        return sign_mult * float('inf')  # Inf
+
+    exponent = exponent_raw - (2 ** (exp_len - 1) - 1)
+
+    if exponent_raw == 0:
+        mant_mult = 0  # Gradual Underflow
+    else:
+        mant_mult = 1
+
+    for b in range(mant_len - 1, -1, -1):
+        if mantissa & (2 ** b):
+            mant_mult += 1 / (2 ** (mant_len - b))
+
+    return sign_mult * (2 ** exponent) * mant_mult
+
+
+def read_traces(file_ptr, samples, traces, hdr_length, format):
+    data = numpy.empty((traces,samples),dtype=numpy.float)
+    data_raw = 0
+    trace = 0
+    sample = 0
+    print(f'traces: {file_ptr.peek()[0]}, samples: {samples}')
+    print(f'file_ptr: {file_ptr}, hdr_length: {hdr_length}, f+h: {hdr_length}')
+
+    for trace in range(traces):
+        file_ptr.seek(hdr_length, 1)
+        if format == 8058:
+            # 32 bit data
+            data_raw = file_ptr.read(4 * samples)
+        else:
+            # 24 bit data
+            data_raw = file_ptr.read(3 * samples)
+
+        for sample in range(samples):
+            if format == 8058:
+                data[trace, sample] = ieee_754_conversion(int.from_bytes(pack("BBBB", data_raw[4*sample], data_raw[4*sample + 1], data_raw[4*sample+2], data_raw[4*sample+3]), 'big'))
+            else:
+                data[trace, sample] = data[trace, sample] = convert_24bit(data_raw[3*sample], data_raw[3*sample + 1], data_raw[3*sample+2])
+    return data
+
 class SEGD_trace(object):
 
-    def __init__(self,hdr_block):
+    def __init__(self, hdr_block):
         
-        ch_set_hdr      =   unpack('>32B',hdr_block)
+        ch_set_hdr      =   unpack('>32B', hdr_block)
         
         self._ch_set    =   pbcd2dec(ch_set_hdr[1:2])
         self.start      =   (ch_set_hdr[2]*2**8+ch_set_hdr[3])*2
@@ -54,7 +124,7 @@ class SEGD_trace(object):
         self.array_forming  =   ch_set_hdr[31]
 
     def __str__(self):
-        # Cahnnel set header information
+        # Channel set header information
         readable_output = 'Start of record: \t {0}ms\n'.format(self.start)
         readable_output += 'Stop of record: \t {0}ms\n'.format(self.stop)
         readable_output += 'MP factor: \t\t {0}\n'.format(self.mp_factor)
@@ -88,9 +158,7 @@ class SEGD(object):
         # General header block #3
         gen_hdr_3   =   f.read(32)
         
-        
         # Header block #1
-        
         self.file_number    =   pbcd2dec(gen_hdr_1[0:2])
         self.segd_format    =   pbcd2dec(gen_hdr_1[2:4])
         
@@ -116,7 +184,10 @@ class SEGD(object):
 
 
         # Header block #2
-        
+        # If using extended file_number (First 4 bytes FFFF), take 3 first bytes of second header
+        if(self.file_number == pbcd2dec((0xff, 0xff))):
+            self.file_number = int.from_bytes(pack("BBB", gen_hdr_2[0], gen_hdr_2[1], gen_hdr_2[2]), 'big')
+            
         if self._extended_hdr_blocks  == 165:
             self._extended_hdr_blocks   =   gen_hdr_2[5]*256+gen_hdr_2[6]
                 
@@ -148,54 +219,45 @@ class SEGD(object):
     
         f.close()
 
-    def _channel_set_entry_points(self,file_ptr):
-        
+    def _channel_set_entry_points(self, file_ptr):
+        count = 0
         for ch_hdr in self.channel_set_headers:
             
             # store entry point position
             ch_hdr._file_ptr = file_ptr.tell()
             
-            # check extended header length
-            trc_hdr_1           =   unpack('>20B',file_ptr.read(20))
-            ch_hdr._hdr_length  =   20 +32*trc_hdr_1[9]
-            
-            # calculate number of samples per trace
-            # can be extracted from extended header byte pos 7-10
-            ch_hdr._samples = int((ch_hdr.stop - ch_hdr.start)/self.dt*1e-3)
-            
-            # calculate trace length for ease of use with a file pointer
-            if self.segd_format == 8058:
-                # 32 bit data
-                ch_hdr._trace_length   =   ch_hdr._hdr_length+ch_hdr._samples*4
-            else:
-                # 24 bit data
-                ch_hdr._trace_length   =   ch_hdr._hdr_length+ch_hdr._samples*3
-            
-            # jumpt to next channel set
-            file_ptr.seek(ch_hdr.channels*ch_hdr._trace_length-20,1)
+            if(ch_hdr.channels > 0):
+                # check extended header length
+                trc_hdr_1           =   unpack('>20B',file_ptr.read(20))
+                ch_hdr._hdr_length  =   20+32*trc_hdr_1[9]
                 
-    def data(self,channel_set):
-        '''Returns a numpy array of the data in teh selected channelset'''
-        f = open(self.file_name,'rb')
+                # calculate number of samples per trace
+                # can be extracted from extended header byte pos 7-10
+                ch_hdr._samples = int((ch_hdr.stop - ch_hdr.start)/self.dt*1e-3) + 1
+                
+                # calculate trace length for ease of use with a file pointer
+                if self.segd_format == 8058:
+                    # 32 bit data
+                    ch_hdr._trace_length   =   ch_hdr._hdr_length+ch_hdr._samples*4
+                else:
+                    # 24 bit data
+                    ch_hdr._trace_length   =   ch_hdr._hdr_length+ch_hdr._samples*3
+                
+                print(f'entry point #{count}: {ch_hdr._trace_length} : {ch_hdr._hdr_length} : {ch_hdr._samples}')
+                count = count + 1 
+                # jump to next channel set
+                file_ptr.seek(ch_hdr.channels*ch_hdr._trace_length - 20, 1)
+                
+    def data(self, channel_set):
+        '''Returns a numpy array of the data in the selected channelset'''
+        f = open(self.file_name, 'rb')
     
-        f.seek(self.channel_set_headers[channel_set]._file_ptr,0)
+        f.seek(self.channel_set_headers[channel_set]._file_ptr, 0)
         samples     = self.channel_set_headers[channel_set]._samples
         traces      = self.channel_set_headers[channel_set].channels
         hdr_length  = self.channel_set_headers[channel_set]._hdr_length
     
-        return read_traces(f,samples,traces,hdr_length)
-    
-    def dataFrame(self,channel_set):
-        '''Returns pandas Multiindex for requested dataset'''
-
-        data = pandas.DataFrame(data=self.data(channel_set).T)
-        data.index = pandas.MultiIndex.from_product([[self.file_number],
-                        numpy.linspace(self.channel_set_headers[channel_set].start*1e-3,
-                                       self.channel_set_headers[channel_set].stop*1e-3,
-                                       self.channel_set_headers[channel_set]._samples)],
-                                        names = ['FFID','time'])
-    
-        return data
+        return read_traces(f,samples,traces,hdr_length, self.segd_format)
 
     def __str__(self):
     
