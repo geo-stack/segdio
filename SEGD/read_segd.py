@@ -16,8 +16,6 @@ def pbcd2dec(pbcd):
 def convert_24bit(byte_string1, byte_string2, byte_string3):
     return (byte_string1<<24|byte_string2<<16|byte_string3<<8)>>8
 
-
-
 # Convert 32 bits to their IEEEE 754
 # Taken from https://gist.github.com/AlexEshoo/d3edc53129ed010b0a5b693b88c7e0b5
 def ieee_754_conversion(n, sgn_len=1, exp_len=8, mant_len=23):
@@ -64,10 +62,6 @@ def ieee_754_conversion(n, sgn_len=1, exp_len=8, mant_len=23):
 def read_traces(file_ptr, samples, traces, hdr_length, format):
     data = numpy.empty((traces,samples),dtype=numpy.float)
     data_raw = 0
-    trace = 0
-    sample = 0
-    #print(f'traces: {file_ptr.peek()[0]}, samples: {samples}')
-    #print(f'file_ptr: {file_ptr}, hdr_length: {hdr_length}, f+h: {hdr_length}')
 
     for trace in range(traces):
         file_ptr.seek(hdr_length, 1)
@@ -80,12 +74,61 @@ def read_traces(file_ptr, samples, traces, hdr_length, format):
 
         for sample in range(samples):
             if format == 8058:
-                data[trace, sample] = ieee_754_conversion(int.from_bytes(pack("BBBB", data_raw[4*sample], data_raw[4*sample + 1], data_raw[4*sample+2], data_raw[4*sample+3]), 'big'))
+                data[trace, sample] = ieee_754_conversion(int.from_bytes(data_raw[4*sample:4*sample+4], 'big'))
             else:
                 data[trace, sample] = data[trace, sample] = convert_24bit(data_raw[3*sample], data_raw[3*sample + 1], data_raw[3*sample+2])
     return data
 
+def read_traces_header(file_ptr, traces, format, channel_set_header):
+    for trace in range(traces):
+      # check extended header length
+        trc_hdr_1 = unpack('>20B',file_ptr.read(20))
+        channel_set_header._hdr_length = 20+32*trc_hdr_1[9]
+        
+        # read extended trace header
+        ext_trc_hdr_1 = unpack('>32B',file_ptr.read(32))
+        
+        # calculate number of samples per trace
+        # can be extracted from extended header byte pos 7-10
+        channel_set_header._samples = int.from_bytes(ext_trc_hdr_1[7:10], 'big')
+        
+        # calculate trace length for ease of use with a file pointer
+        if format == 8058:
+            # 32 bit data
+            channel_set_header._trace_length = channel_set_header._hdr_length+channel_set_header._samples*4
+        else:
+            # 24 bit data
+            channel_set_header._trace_length = channel_set_header._hdr_length+channel_set_header._samples*3
+        
+        channel_set_header.trace_headers[trace] = SEGD_trace(trc_hdr_1, ext_trc_hdr_1)
+        
+        file_ptr.seek(channel_set_header._hdr_length - 20 - 32, 1)
+        if format == 8058:
+            # 32 bit data
+            file_ptr.read(4 * channel_set_header._samples)
+        else:
+            # 24 bit data
+            file_ptr.read(3 * channel_set_header._samples)
+            
 class SEGD_trace(object):
+
+    def __init__(self, trc_hdr, ext_trc_hdr_1):
+
+        self.trace_number           = int.from_bytes(trc_hdr[4:6], 'big')
+        self.receiver_line_number   = int.from_bytes(ext_trc_hdr_1[0:3], 'big')
+        self.receiver_point_number  = int.from_bytes(ext_trc_hdr_1[3:6], 'big')
+        self.receiver_point_index   = ext_trc_hdr_1[6]
+
+    def __str__(self):
+        # Trace header information
+        readable_output = 'Trace number: \t\t\t {0}\n'.format(self.trace_number)
+        readable_output += 'Receiver line number: \t\t {0}\n'.format(self.receiver_line_number)
+        readable_output += 'Receiver point number: \t\t {0}\n'.format(self.receiver_point_number)
+        readable_output += 'Receiver point index: \t\t {0}\n\n'.format(self.receiver_point_index)
+
+        return readable_output
+
+class SEGD_channel(object):
 
     def __init__(self, hdr_block):
         
@@ -96,7 +139,6 @@ class SEGD_trace(object):
         self.stop       =   (ch_set_hdr[4]*2**8+ch_set_hdr[5])*2
 
         mp_factor  =   bin(ch_set_hdr[7])+bin(ch_set_hdr[6])[2:].zfill(8)
-        
 
         # If the gain field is set to zero and the above field will only be 10 characters long.
         # For the calculation below, the number needs to be padded to 12 bits.
@@ -110,7 +152,6 @@ class SEGD_trace(object):
         if mp_factor[2]=='1':
             channel_gain *= -1
 
-
         self.mp_factor      =   2**channel_gain
 
         self.channels       =   pbcd2dec(ch_set_hdr[8:10])
@@ -122,6 +163,8 @@ class SEGD_trace(object):
         self.hp_filter_slope    =   divmod(ch_set_hdr[18],16)[0]*100+pbcd2dec(ch_set_hdr[19:20])
         self.streamer_no    =   ch_set_hdr[30]
         self.array_forming  =   ch_set_hdr[31]
+        
+        self.trace_headers = numpy.empty(self.channels, dtype=object)
 
     def __str__(self):
         # Channel set header information
@@ -186,7 +229,7 @@ class SEGD(object):
         # Header block #2
         # If using extended file_number (First 4 bytes FFFF), take 3 first bytes of second header
         if(self.file_number == pbcd2dec((0xff, 0xff))):
-            self.file_number = int.from_bytes(pack("BBB", gen_hdr_2[0], gen_hdr_2[1], gen_hdr_2[2]), 'big')
+            self.file_number = int.from_bytes(gen_hdr_2[0:3], 'big')
             
         if self._extended_hdr_blocks  == 165:
             self._extended_hdr_blocks   =   gen_hdr_2[5]*256+gen_hdr_2[6]
@@ -200,10 +243,14 @@ class SEGD(object):
         self.segd_rev   =   pbcd2dec(gen_hdr_2[10:11])+pbcd2dec(gen_hdr_2[11:12])/10.
         self._extended_trace_length     =   gen_hdr_2[31]
         
+        # Header block #3
+        self.source_line_number = int.from_bytes(gen_hdr_3[3:6], 'big') + int.from_bytes(gen_hdr_3[6:8], 'big') / 100
+        self.source_point_number = int.from_bytes(gen_hdr_3[8:11], 'big') + int.from_bytes(gen_hdr_3[11:13], 'big') / 100
+        self.source_point_index = gen_hdr_3[13]
         # rev 3.0 introduced a fine grain timestamp in bytes 1-8 in Header block #3
-        self._gps_timestamp = unpack('>q',gen_hdr_3[:8])
+        self._gps_timestamp = unpack('>q', gen_hdr_3[:8])
 
-        self.channel_set_headers = [SEGD_trace(f.read(32)) for _ in range(self.channel_sets)]
+        self.channel_set_headers = [SEGD_channel(f.read(32)) for _ in range(self.channel_sets)]
 
         # skip Host recording sys, Line ID for cables and Shot time/reel number
         f.seek(32*3,1)
@@ -220,34 +267,15 @@ class SEGD(object):
         f.close()
 
     def _channel_set_entry_points(self, file_ptr):
-        count = 0
         for ch_hdr in self.channel_set_headers:
             
             # store entry point position
             ch_hdr._file_ptr = file_ptr.tell()
             
             if(ch_hdr.channels > 0):
-                # check extended header length
-                trc_hdr_1           =   unpack('>20B',file_ptr.read(20))
-                ch_hdr._hdr_length  =   20+32*trc_hdr_1[9]
-                
-                # calculate number of samples per trace
-                # can be extracted from extended header byte pos 7-10
-                ch_hdr._samples = int((ch_hdr.stop - ch_hdr.start)/self.dt*1e-3) + 1
-                
-                # calculate trace length for ease of use with a file pointer
-                if self.segd_format == 8058:
-                    # 32 bit data
-                    ch_hdr._trace_length   =   ch_hdr._hdr_length+ch_hdr._samples*4
-                else:
-                    # 24 bit data
-                    ch_hdr._trace_length   =   ch_hdr._hdr_length+ch_hdr._samples*3
-                
-                #print(f'entry point #{count}: {ch_hdr._trace_length} : {ch_hdr._hdr_length} : {ch_hdr._samples}')
-                count = count + 1 
                 # jump to next channel set
-                file_ptr.seek(ch_hdr.channels*ch_hdr._trace_length - 20, 1)
-                
+                read_traces_header(file_ptr, ch_hdr.channels , self.segd_format, ch_hdr)
+    
     def data(self, channel_set):
         '''Returns a numpy array of the data in the selected channelset'''
         f = open(self.file_name, 'rb')
@@ -268,7 +296,10 @@ class SEGD(object):
         readable_output += 'File Format: \t\t {0} rev {1}\n'.format(self.segd_format,self.segd_rev)
         readable_output += 'Time stamp:  \t\t {0}\n'.format(self.time_stamp.ctime())
         readable_output += 'Trace length:\t\t {0}s\n'.format(self.trace_length)
-        readable_output += 'Sample rate: \t\t {0}s\n\n\n'.format(self.dt)
+        readable_output += 'Sample rate: \t\t {0}s\n\n'.format(self.dt)
+        readable_output += 'Source line number: \t\t {0}\n'.format(self.source_line_number)
+        readable_output += 'Source point number: \t\t {0}\n'.format(self.source_point_number)
+        readable_output += 'Source point index: \t\t {0}\n\n\n'.format(self.source_point_index)
         
         for idx,ch_set in enumerate(self.channel_set_headers):
             readable_output += 'Channel set {0}:\n'.format(idx)
