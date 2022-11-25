@@ -17,7 +17,7 @@ Reader for seismic tape files conforming to the SEG-D specifications.
 
 ### Print file summary
 ```python
-from read_segd import SEGD
+from segdio import SEGD
 segd = SEGD("segd_file_name.segd")
 print(segd)
  ```
