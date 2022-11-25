@@ -1,7 +1,12 @@
 from setuptools import setup
 from segdio import __version__, __project_url__
+import csv
 
 """Installation script """
+
+with open('requirements.txt', 'r') as csvfile:
+    INSTALL_REQUIRES = list(csv.reader(csvfile))
+INSTALL_REQUIRES = [item for sublist in INSTALL_REQUIRES for item in sublist]
 
 setup(name='segdio',
       version=__version__,
@@ -15,4 +20,5 @@ setup(name='segdio',
           'Programming Language :: Python :: 3',
           ],
       packages=['segdio'],
+      install_requires=INSTALL_REQUIRES,
       )
